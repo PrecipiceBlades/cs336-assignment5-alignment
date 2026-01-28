@@ -296,9 +296,15 @@ def init_vllm(
     Start the inference process, here we use vLLM to hold a model on
     a GPU separate from the policy.
     
-    Note: In vLLM 0.14.x, device placement is handled via CUDA_VISIBLE_DEVICES
-    or tensor_parallel_size. The device parameter is kept for API compatibility
-    but the actual device is controlled by visible GPUs at init time.
+    In vLLM 0.14.x, device placement is controlled via CUDA_VISIBLE_DEVICES.
+    This function expects CUDA_VISIBLE_DEVICES to be set appropriately before
+    calling, such that cuda:0 in the visible devices is where vLLM should run.
+    
+    Args:
+        model_id: Path to the model
+        device: CUDA device string (e.g., "cuda:0"). Used for extracting GPU index.
+        seed: Random seed
+        gpu_memory_utilization: Fraction of GPU memory to use
     """
     import os
     vllm_set_random_seed(seed)
@@ -309,29 +315,86 @@ def init_vllm(
     # Patch vLLM to make sure we can place the vLLM model on the desired device
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
     
-    with world_size_patch:
-        return LLM(
-            model=model_id,
-            dtype=torch.bfloat16,
-            enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization,
-            enforce_eager=True,  # Disable CUDA graphs to reduce memory
-        )
+    # Try to find and patch the profiling assertion if it exists
+    # (path varies between vLLM versions)
+    profiling_patches_to_try = [
+        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+        "vllm.v1.worker.gpu_worker.GPUWorker._assert_memory_footprint_increased_during_profiling",
+    ]
+    
+    profiling_patch = None
+    for patch_path in profiling_patches_to_try:
+        try:
+            profiling_patch = patch(patch_path, return_value=None)
+            # Test if the patch target exists
+            profiling_patch.start()
+            profiling_patch.stop()
+            break
+        except (AttributeError, ModuleNotFoundError):
+            profiling_patch = None
+            continue
+    
+    # Apply patches and create LLM
+    if profiling_patch is not None:
+        with world_size_patch, profiling_patch:
+            return LLM(
+                model=model_id,
+                dtype=torch.bfloat16,
+                enable_prefix_caching=True,
+                gpu_memory_utilization=gpu_memory_utilization,
+                enforce_eager=True,  # Disable CUDA graphs to reduce memory
+            )
+    else:
+        with world_size_patch:
+            return LLM(
+                model=model_id,
+                dtype=torch.bfloat16,
+                enable_prefix_caching=True,
+                gpu_memory_utilization=gpu_memory_utilization,
+                enforce_eager=True,  # Disable CUDA graphs to reduce memory
+            )
 
 def init_vllm_multi_gpu(
     model_id: str,
     tensor_parallel_size: int = 1,
     seed: int = 42,
     gpu_memory_utilization: float = 0.85,
-    device: str = None,
 ) -> LLM:
     """
     Initialize vLLM with multi-GPU support via tensor parallelism.
     
+    In vLLM 0.14.x, device placement is controlled via CUDA_VISIBLE_DEVICES.
+    Set CUDA_VISIBLE_DEVICES before calling this function to control which
+    physical GPUs are used for tensor parallelism.
+    
     Args:
-        device: CUDA device string like "cuda:1" to place vLLM on specific GPU
+        model_id: Path to the model
+        tensor_parallel_size: Number of GPUs for tensor parallelism
+        seed: Random seed
+        gpu_memory_utilization: Fraction of GPU memory to use
     """
     vllm_set_random_seed(seed)
+    
+    # Monkeypatch from TRL to allow single-process vLLM
+    # https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_trainer.py
+    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+    
+    # Try to find and patch the profiling assertion if it exists
+    profiling_patches_to_try = [
+        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+        "vllm.v1.worker.gpu_worker.GPUWorker._assert_memory_footprint_increased_during_profiling",
+    ]
+    
+    profiling_patch = None
+    for patch_path in profiling_patches_to_try:
+        try:
+            profiling_patch = patch(patch_path, return_value=None)
+            profiling_patch.start()
+            profiling_patch.stop()
+            break
+        except (AttributeError, ModuleNotFoundError):
+            profiling_patch = None
+            continue
     
     kwargs = {
         "model": model_id,
@@ -339,32 +402,36 @@ def init_vllm_multi_gpu(
         "dtype": torch.bfloat16,
         "enable_prefix_caching": True,
         "gpu_memory_utilization": gpu_memory_utilization,
+        "enforce_eager": True,  # Disable CUDA graphs to reduce memory
     }
-    if device is not None:
-        kwargs["device"] = device
     
-    # Monkeypatch from TRL to place vLLM on desired device
-    # https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_trainer.py
-    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    
-    # Try to patch profiling assertion (path changed in newer vLLM versions)
-    try:
-        profiling_patch = patch(
-            "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-            return_value=None,
-        )
+    if profiling_patch is not None:
         with world_size_patch, profiling_patch:
             return LLM(**kwargs)
-    except (AttributeError, ModuleNotFoundError):
-        # Newer vLLM versions may not have this path
+    else:
         with world_size_patch:
             return LLM(**kwargs)
 
 def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM) -> None:
     """
-    Copied from https://github.com/huggingface/trl/blob/
-        22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py#L670.
+    Load trained policy weights into vLLM instance.
+    
+    For vLLM 0.14.x V1 engine, we use apply_model to send a function that
+    loads weights into the model running in the EngineCore subprocess.
+    
+    Adapted from TRL for vLLM 0.14.x compatibility.
     """
     state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
+    
+    def _load_weights(model):
+        """Function to load weights, called in the EngineCore subprocess."""
+        model.load_weights(state_dict.items())
+        return True
+    
+    # For V1 engine, use apply_model to load weights into subprocess
+    if hasattr(llm.llm_engine, 'apply_model'):
+        llm.llm_engine.apply_model(_load_weights)
+    else:
+        # Fallback for older vLLM versions (V0 engine)
+        llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+        llm_model.load_weights(state_dict.items())
