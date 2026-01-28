@@ -1,0 +1,370 @@
+from __future__ import annotations
+
+import random
+import numpy as np
+import torch
+from torch import Tensor
+from transformers import PreTrainedTokenizerBase, PreTrainedModel
+from unittest.mock import patch
+from vllm import LLM
+
+
+def vllm_set_random_seed(seed: int):
+    """Set random seed for reproducibility (replaces vllm.model_executor.set_random_seed)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def tokenize_prompt_and_output(
+    prompt_strs: list[str],
+    output_strs: list[str],
+    tokenizer: PreTrainedTokenizerBase,
+) -> dict[str, Tensor]:
+    """Tokenize the prompt and output strings, and construct a mask that is 1
+    for the response tokens and 0 for other tokens (prompt or padding).
+
+    Args:
+        prompt_strs: list[str], the prompt strings.
+        output_strs: list[str], the output strings.
+        tokenizer: PreTrainedTokenizer, the tokenizer to use.
+
+    Returns:
+        dict[str, torch.Tensor]:
+            "input_ids": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
+                the tokenized prompt and output strings, with the final token sliced off.
+            "labels": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
+                shifted input_ids (i.e., the input_ids without the first token).
+            "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
+                a mask on the response tokens in `labels`.
+    """
+    batch_size = len(prompt_strs)
+    
+    # Get the EOS token ID
+    eos_token_id = tokenizer.eos_token_id
+    # Use EOS as pad token if pad_token_id is not set
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_token_id
+    
+    # Tokenize each prompt and output separately (without special tokens)
+    prompt_token_ids = []
+    output_token_ids = []
+    prompt_lens = []
+    output_lens = []
+    
+    for prompt_str, output_str in zip(prompt_strs, output_strs):
+        # Tokenize without special tokens
+        prompt_tokens = tokenizer(prompt_str, add_special_tokens=False)["input_ids"]
+        output_tokens = tokenizer(output_str, add_special_tokens=False)["input_ids"]
+        
+        prompt_token_ids.append(prompt_tokens)
+        output_token_ids.append(output_tokens)
+        prompt_lens.append(len(prompt_tokens))
+        output_lens.append(len(output_tokens))
+    
+    # Calculate max length: prompt + output (no EOS added based on the snapshot analysis)
+    # The max sequence is just prompt + output
+    max_len = max(p_len + o_len for p_len, o_len in zip(prompt_lens, output_lens))
+    
+    # Build the full sequences with padding
+    full_sequences = []
+    for i in range(batch_size):
+        # Concatenate prompt + output
+        full_seq = prompt_token_ids[i] + output_token_ids[i]
+        # Pad to max_len
+        padding_needed = max_len - len(full_seq)
+        full_seq = full_seq + [pad_token_id] * padding_needed
+        full_sequences.append(full_seq)
+    
+    # Convert to tensor
+    full_tensor = torch.tensor(full_sequences, dtype=torch.long)
+    
+    # input_ids: full sequence without the last token
+    input_ids = full_tensor[:, :-1]
+    
+    # labels: full sequence without the first token (shifted by 1)
+    labels = full_tensor[:, 1:]
+    
+    # response_mask: True for output tokens in labels, False for prompt/padding
+    # In labels (shifted by 1), output tokens for example i are at positions:
+    # [prompt_lens[i] - 1, prompt_lens[i] - 1 + output_lens[i] - 1] inclusive
+    # i.e., [prompt_lens[i] - 1, prompt_lens[i] + output_lens[i] - 2]
+    seq_len = input_ids.shape[1]
+    response_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool)
+    
+    for i in range(batch_size):
+        start_idx = prompt_lens[i] - 1
+        end_idx = prompt_lens[i] + output_lens[i] - 2  # inclusive
+        response_mask[i, start_idx:end_idx + 1] = True
+    
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "response_mask": response_mask,
+    }
+
+
+def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """Get the entropy of the next-token predictions (i.e., entropy over the vocabulary dimension).
+
+    Args:
+        logits: torch.Tensor of shape (batch_size, sequence_length, vocab_size)
+            containing unnormalized logits.
+
+    Returns:
+        torch.Tensor of shape (batch_size, sequence_length). The entropy for each
+            next-token prediction.
+
+    Note: Use a numerically stable method (e.g., using logsumexp) to avoid overflow.
+    """
+    normalized_logits = logits - logits.logsumexp(dim=-1, keepdim=True)
+    return (-normalized_logits * normalized_logits.exp()).sum(dim=-1)
+
+
+def get_response_log_probs(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    return_token_entropy: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Get per-token conditional log-probabilities from a causal language model,
+    and optionally the entropy of the model's next-token distribution.
+
+    Args:
+        model: PreTrainedModel HuggingFace model used for scoring (placed on the
+            correct device and in inference mode if gradients should not be computed).
+        input_ids: torch.Tensor shape (batch_size, sequence_length), concatenated
+            prompt + response tokens as produced by your tokenization method.
+        labels: torch.Tensor shape (batch_size, sequence_length), labels as produced
+            by your tokenization method.
+        return_token_entropy: bool If True, also return per-token entropy by calling
+            compute_entropy.
+
+    Returns:
+        dict[str, torch.Tensor].
+            "log_probs" shape (batch_size, sequence_length), conditional log-probabilities
+                log p_theta(x_t | x_{<t}).
+            "token_entropy" optional, shape (batch_size, sequence_length), per-token entropy
+                for each position (present only if return_token_entropy=True).
+    """
+    logits = model(input_ids).logits
+    log_probs = logits.log_softmax(dim=-1).gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    entropy = None
+    if return_token_entropy:
+        entropy = compute_entropy(logits)
+    return {
+        "log_probs": log_probs,
+        "token_entropy": entropy,
+    }
+
+
+def sft_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    normalize_constant: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Execute a forward-and-backward pass on a microbatch.
+
+    Args:
+        policy_log_probs: (batch_size, sequence_length), per-token log-probabilities
+            from the SFT policy being trained.
+        response_mask: (batch_size, sequence_length), 1 for response tokens, 0 for
+            prompt/padding.
+        gradient_accumulation_steps: Number of microbatches per optimizer step.
+        normalize_constant: The constant by which to divide the sum. It is fine to
+            leave this as 1.0.
+
+    Returns:
+        tuple[torch.Tensor, dict[str, torch.Tensor]].
+            loss: scalar tensor. The microbatch loss, adjusted for gradient accumulation.
+                We return this so we can log it.
+            metadata: Dict with metadata from the underlying loss call, and any other
+                statistics you might want to log.
+
+    Implementation tips:
+        - You should call loss.backward() in this function. Make sure to adjust for
+          gradient accumulation.
+    """
+    batch_size = policy_log_probs.shape[0]
+    # SFT loss: negative log likelihood, mean over batch, scaled for gradient accumulation
+    loss = -(policy_log_probs * response_mask).sum() / batch_size / normalize_constant / gradient_accumulation_steps
+    loss.backward()
+    return loss, {}
+
+
+def log_generations(
+    prompts: list[str],
+    responses: list[str],
+    ground_truths: list[str],
+    rewards: list[dict[str, float]],
+    token_entropies: list[float] | None = None,
+    step: int | None = None,
+    use_wandb: bool = True,
+) -> dict:
+    """Log generations from the model for monitoring during training.
+
+    Args:
+        prompts: List of input prompts.
+        responses: List of responses generated by the SFT/RL model.
+        ground_truths: List of ground-truth answers.
+        rewards: List of reward dicts, each containing "reward", "format_reward", "answer_reward".
+        token_entropies: Optional list of average token entropies per response.
+        step: Optional training step for logging.
+        use_wandb: Whether to log to wandb.
+
+    Returns:
+        dict with aggregated statistics:
+            - avg_reward, avg_format_reward, avg_answer_reward
+            - avg_response_length, avg_correct_response_length, avg_incorrect_response_length
+            - avg_token_entropy (if token_entropies provided)
+    """
+    import wandb
+
+    n = len(prompts)
+    
+    # Compute response lengths
+    response_lengths = [len(r) for r in responses]
+    
+    # Separate correct vs incorrect based on answer_reward > 0
+    correct_lengths = []
+    incorrect_lengths = []
+    for i, reward_dict in enumerate(rewards):
+        if reward_dict.get("answer_reward", 0) > 0:
+            correct_lengths.append(response_lengths[i])
+        else:
+            incorrect_lengths.append(response_lengths[i])
+    
+    # Compute statistics
+    stats = {
+        "avg_reward": sum(r["reward"] for r in rewards) / n if n > 0 else 0,
+        "avg_format_reward": sum(r.get("format_reward", 0) for r in rewards) / n if n > 0 else 0,
+        "avg_answer_reward": sum(r.get("answer_reward", 0) for r in rewards) / n if n > 0 else 0,
+        "avg_response_length": sum(response_lengths) / n if n > 0 else 0,
+        "avg_correct_response_length": sum(correct_lengths) / len(correct_lengths) if correct_lengths else 0,
+        "avg_incorrect_response_length": sum(incorrect_lengths) / len(incorrect_lengths) if incorrect_lengths else 0,
+        "num_correct": len(correct_lengths),
+        "num_incorrect": len(incorrect_lengths),
+    }
+    
+    if token_entropies is not None:
+        stats["avg_token_entropy"] = sum(token_entropies) / len(token_entropies) if token_entropies else 0
+    
+    # Create a table of examples for wandb
+    if use_wandb and wandb.run is not None:
+        # Log aggregated stats
+        log_dict = {f"generations/{k}": v for k, v in stats.items()}
+        if step is not None:
+            wandb.log(log_dict, step=step)
+        else:
+            wandb.log(log_dict)
+        
+        # Log a table of examples
+        columns = ["prompt", "response", "ground_truth", "reward", "format_reward", "answer_reward"]
+        if token_entropies is not None:
+            columns.append("token_entropy")
+        
+        data = []
+        for i in range(n):
+            row = [
+                prompts[i],
+                responses[i],
+                ground_truths[i],
+                rewards[i]["reward"],
+                rewards[i].get("format_reward", 0),
+                rewards[i].get("answer_reward", 0),
+            ]
+            if token_entropies is not None:
+                row.append(token_entropies[i])
+            data.append(row)
+        
+        table = wandb.Table(columns=columns, data=data)
+        if step is not None:
+            wandb.log({"generations/examples": table}, step=step)
+        else:
+            wandb.log({"generations/examples": table})
+    
+    return stats
+
+def init_vllm(
+    model_id: str,
+    device: str,
+    seed: int,
+    gpu_memory_utilization: float = 0.85,
+) -> LLM:
+    """
+    Start the inference process, here we use vLLM to hold a model on
+    a GPU separate from the policy.
+    
+    Note: In vLLM 0.14.x, device placement is handled via CUDA_VISIBLE_DEVICES
+    or tensor_parallel_size. The device parameter is kept for API compatibility
+    but the actual device is controlled by visible GPUs at init time.
+    """
+    import os
+    vllm_set_random_seed(seed)
+
+    # Monkeypatch from TRL:
+    # https://github.com/huggingface/trl/blob/
+    #     22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py
+    # Patch vLLM to make sure we can place the vLLM model on the desired device
+    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+    
+    with world_size_patch:
+        return LLM(
+            model=model_id,
+            dtype=torch.bfloat16,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=True,  # Disable CUDA graphs to reduce memory
+        )
+
+def init_vllm_multi_gpu(
+    model_id: str,
+    tensor_parallel_size: int = 1,
+    seed: int = 42,
+    gpu_memory_utilization: float = 0.85,
+    device: str = None,
+) -> LLM:
+    """
+    Initialize vLLM with multi-GPU support via tensor parallelism.
+    
+    Args:
+        device: CUDA device string like "cuda:1" to place vLLM on specific GPU
+    """
+    vllm_set_random_seed(seed)
+    
+    kwargs = {
+        "model": model_id,
+        "tensor_parallel_size": tensor_parallel_size,
+        "dtype": torch.bfloat16,
+        "enable_prefix_caching": True,
+        "gpu_memory_utilization": gpu_memory_utilization,
+    }
+    if device is not None:
+        kwargs["device"] = device
+    
+    # Monkeypatch from TRL to place vLLM on desired device
+    # https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_trainer.py
+    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+    
+    # Try to patch profiling assertion (path changed in newer vLLM versions)
+    try:
+        profiling_patch = patch(
+            "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+            return_value=None,
+        )
+        with world_size_patch, profiling_patch:
+            return LLM(**kwargs)
+    except (AttributeError, ModuleNotFoundError):
+        # Newer vLLM versions may not have this path
+        with world_size_patch:
+            return LLM(**kwargs)
+
+def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM) -> None:
+    """
+    Copied from https://github.com/huggingface/trl/blob/
+        22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py#L670.
+    """
+    state_dict = policy.state_dict()
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model.load_weights(state_dict.items())
