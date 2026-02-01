@@ -12,10 +12,17 @@ Usage:
     python -m cs336_alignment.sft --vllm_gpu 0 --train_gpu 1
 """
 import os
+import sys
 import json
 import random
 import numpy as np
 from pathlib import Path
+
+
+def print_flush(*args, **kwargs):
+    """Print with immediate flush for subprocess compatibility."""
+    print(*args, **kwargs)
+    sys.stdout.flush()
 
 
 def set_random_seed(seed: int):
@@ -43,8 +50,10 @@ def load_train_data(data_path: str, num_samples: int = None):
         for line in f:
             data = json.loads(line)
             question = data["question"]
+            # Remove <think> prefix from response since prompt ends with <think>
             response = data["response"].removeprefix("<think>")
-            prompt = PROMPT_TEMPLATE.format(question=question).removesuffix("<think>")
+            # Keep <think> in prompt to match validation format
+            prompt = PROMPT_TEMPLATE.format(question=question)
             prompts.append(prompt)
             responses.append(response)
             if num_samples and len(prompts) >= num_samples:
@@ -95,53 +104,6 @@ def evaluate(llm, sampling_params, val_prompts: list[str], val_ground_truths: li
     return accuracy
 
 
-def init_vllm_isolated(model_path: str, vllm_gpu: int, gpu_memory_utilization: float):
-    """Initialize vLLM in an isolated process with restricted GPU visibility.
-    
-    This function sets CUDA_VISIBLE_DEVICES to only include the vLLM GPU,
-    ensuring the EngineCore subprocess only sees and uses that single GPU.
-    """
-    import multiprocessing as mp
-    from vllm import LLM
-    
-    # Use spawn to get a clean process without inherited CUDA contexts
-    ctx = mp.get_context('spawn')
-    
-    def _init_vllm(model_path, gpu_memory_utilization, result_queue):
-        """Worker function that runs in isolated subprocess."""
-        import os
-        # This is crucial: the subprocess only sees the specified GPU
-        # CUDA_VISIBLE_DEVICES is already set before this subprocess spawns
-        from vllm import LLM
-        import torch
-        
-        from unittest.mock import patch
-        
-        # Apply patches
-        world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-        
-        with world_size_patch:
-            llm = LLM(
-                model=model_path,
-                dtype=torch.bfloat16,
-                enable_prefix_caching=True,
-                gpu_memory_utilization=gpu_memory_utilization,
-                enforce_eager=True,
-            )
-        
-        # Return success signal (actual LLM object can't be pickled)
-        result_queue.put("initialized")
-        
-        # Keep process alive to maintain vLLM
-        import time
-        while True:
-            time.sleep(1)
-    
-    # Note: This approach won't work for our use case because we need
-    # the LLM object in the main process. Let me try a different approach.
-    pass
-
-
 def train(
     model_path: str,
     train_data_path: str,
@@ -153,32 +115,35 @@ def train(
     num_epochs: int,
     vllm_gpu: int = 0,
     train_gpu: int = 1,
-    vllm_gpu_memory_utilization: float = 0.85,
+    vllm_gpu_memory_utilization: float = 0.5,
     use_wandb: bool = True,
 ):
     """Run SFT training with vLLM for evaluation.
     
-    Device Isolation Strategy:
-    vLLM initialization is done with CUDA_VISIBLE_DEVICES restricted to vllm_gpu only.
-    After vLLM spawns its EngineCore subprocess (which inherits the restricted env),
-    we reset CUDA_VISIBLE_DEVICES to include the training GPU.
-    
-    The key insight is that vLLM's EngineCore runs in a SEPARATE process, and that
-    process inherits CUDA_VISIBLE_DEVICES at spawn time. By restricting visibility
-    before spawning, the EngineCore will only ever see and use the vllm_gpu.
+    Device Strategy:
+    - If CUDA_VISIBLE_DEVICES is set externally, use the first visible GPU (cuda:0)
+    - Otherwise, set CUDA_VISIBLE_DEVICES to vllm_gpu
+    - vLLM and training model share the same GPU
+    - vllm_gpu_memory_utilization controls vLLM's memory, leaving rest for training
     """
-    # Step 1: Set CUDA_VISIBLE_DEVICES to ONLY the vLLM GPU
-    # This MUST happen before any torch/vllm imports in this function
-    original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(vllm_gpu)
+    # Check if CUDA_VISIBLE_DEVICES is already set externally
+    external_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if external_cuda_visible:
+        # Use externally set GPU (will be cuda:0)
+        print_flush(f"Using externally set CUDA_VISIBLE_DEVICES={external_cuda_visible}")
+        physical_gpu = external_cuda_visible.split(",")[0]
+    else:
+        # Set CUDA_VISIBLE_DEVICES to the specified vllm_gpu
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(vllm_gpu)
+        physical_gpu = str(vllm_gpu)
     
     # Enable insecure serialization for vLLM apply_model to work with closures
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     
-    print(f"Device configuration:")
-    print(f"  vLLM physical GPU: {vllm_gpu}")
-    print(f"  Training physical GPU: {train_gpu}")
-    print(f"  CUDA_VISIBLE_DEVICES (for vLLM init): {os.environ['CUDA_VISIBLE_DEVICES']}")
+    print_flush(f"Device configuration:")
+    print_flush(f"  Physical GPU: {physical_gpu}")
+    print_flush(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+    print_flush(f"  vLLM memory utilization: {vllm_gpu_memory_utilization}")
     
     # Now import torch and vllm - they will only see the vLLM GPU
     import torch
@@ -196,25 +161,25 @@ def train(
     
     # Sampling parameters for vLLM generation
     sampling_params = SamplingParams(
-        temperature=0.7,
-        top_p=0.95,
+        temperature=1.0,
+        top_p=1.0,
         max_tokens=2048,
         stop=["</answer>"],
         include_stop_str_in_output=True,
     )
     
-    # Initialize vLLM - it will only see GPU 0 (which is physical vllm_gpu)
-    print(f"\nInitializing vLLM (sees only physical GPU {vllm_gpu} as cuda:0)...")
+    # Initialize vLLM - it will only see GPU 0 (the physical GPU)
+    print_flush(f"\nInitializing vLLM on cuda:0 (physical GPU {physical_gpu})...")
     llm = init_vllm(
         model_id=model_path,
         device="cuda:0",
         seed=42,
         gpu_memory_utilization=vllm_gpu_memory_utilization,
     )
-    print("vLLM initialized successfully.")
+    print_flush("vLLM initialized successfully.")
     
     # Check GPU count - should only see 1 GPU at this point
-    print(f"\nPyTorch sees {torch.cuda.device_count()} GPU(s)")
+    print_flush(f"\nPyTorch sees {torch.cuda.device_count()} GPU(s)")
     
     # Now we need to load the training model on a DIFFERENT physical GPU.
     # Since we set CUDA_VISIBLE_DEVICES=vllm_gpu, torch can only see that GPU.
@@ -229,15 +194,15 @@ def train(
     # Check memory on the single visible GPU
     allocated = torch.cuda.memory_allocated(0) / 1e9
     reserved = torch.cuda.memory_reserved(0) / 1e9
-    print(f"\nGPU memory after vLLM init (physical GPU {vllm_gpu}):")
-    print(f"  cuda:0: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
+    print_flush(f"\nGPU memory after vLLM init (physical GPU {physical_gpu}):")
+    print_flush(f"  cuda:0: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
     
     # Load training model on cuda:0 (same GPU as vLLM)
     # vLLM's gpu_memory_utilization controls how much it uses, leaving rest for training
     from transformers import AutoModelForCausalLM, AutoTokenizer
     
-    print(f"\nLoading training model on cuda:0 (physical GPU {vllm_gpu})...")
-    print("(Training shares GPU with vLLM; vLLM's gpu_memory_utilization limits its memory)")
+    print_flush(f"\nLoading training model on cuda:0 (physical GPU {physical_gpu})...")
+    print_flush("(Training shares GPU with vLLM; vLLM's gpu_memory_utilization limits its memory)")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -247,25 +212,25 @@ def train(
     
     # Enable gradient checkpointing to reduce activation memory
     model.gradient_checkpointing_enable()
-    print("Gradient checkpointing enabled to reduce memory usage")
+    print_flush("Gradient checkpointing enabled to reduce memory usage")
     
     model = model.to("cuda:0")
-    print("Training model loaded successfully.")
+    print_flush("Training model loaded successfully.")
     
     # Check GPU memory after training model load
     allocated = torch.cuda.memory_allocated(0) / 1e9
     reserved = torch.cuda.memory_reserved(0) / 1e9
-    print(f"\nGPU memory after training model load:")
-    print(f"  cuda:0: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
+    print_flush(f"\nGPU memory after training model load:")
+    print_flush(f"  cuda:0: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
     
     # Load data
-    print(f"\nLoading training data ({num_samples} samples)...")
+    print_flush(f"\nLoading training data ({num_samples} samples)...")
     train_prompts, train_responses = load_train_data(train_data_path, num_samples)
-    print(f"Loaded {len(train_prompts)} training examples")
+    print_flush(f"Loaded {len(train_prompts)} training examples")
     
-    print("Loading validation data...")
+    print_flush("Loading validation data...")
     val_prompts, val_ground_truths = load_val_data(val_data_path)
-    print(f"Loaded {len(val_prompts)} validation examples")
+    print_flush(f"Loaded {len(val_prompts)} validation examples")
     
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -275,7 +240,7 @@ def train(
     model.train()
     
     for epoch in range(num_epochs):
-        print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===")
+        print_flush(f"\n=== Epoch {epoch + 1}/{num_epochs} ===")
         epoch_loss = 0.0
         num_batches = 0
         
@@ -315,14 +280,14 @@ def train(
                     })
         
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
-        print(f"Epoch {epoch + 1} avg loss: {avg_epoch_loss:.4f}")
+        print_flush(f"Epoch {epoch + 1} avg loss: {avg_epoch_loss:.4f}")
     
     # Final evaluation
-    print("\nFinal evaluation...")
+    print_flush("\nFinal evaluation...")
     model.eval()
     load_policy_into_vllm_instance(model, llm)
     final_accuracy = evaluate(llm, sampling_params, val_prompts, val_ground_truths)
-    print(f"Final Validation Accuracy: {final_accuracy:.2f}%")
+    print_flush(f"Final Validation Accuracy: {final_accuracy:.2f}%")
     
     if use_wandb:
         wandb.log({
@@ -368,8 +333,8 @@ Device Configuration:
                         help="Physical GPU index for vLLM and training (default: 0)")
     parser.add_argument("--train_gpu", type=int, default=1,
                         help="(Deprecated) Training now shares GPU with vLLM")
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.3,
-                        help="Fraction of GPU memory for vLLM KV cache (default: 0.3, leaves room for training)")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.5,
+                        help="Fraction of GPU memory for vLLM KV cache (default: 0.5, balances inference speed and training memory)")
     parser.add_argument("--wandb_project", type=str, default="sft-math")
     parser.add_argument("--wandb_api_key", type=str, default=None,
                         help="Wandb API key (or set WANDB_API_KEY env var)")
@@ -408,7 +373,7 @@ Device Configuration:
     if use_wandb:
         wandb.finish()
     
-    print(f"\nTraining complete. Final accuracy: {accuracy:.2f}%")
+    print_flush(f"\nTraining complete. Final accuracy: {accuracy:.2f}%")
 
 
 if __name__ == "__main__":
