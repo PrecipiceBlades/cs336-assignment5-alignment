@@ -1,0 +1,14 @@
+{
+  "model_path": "/mnt/fsx/fsx-pred/prediction/tdvi/data/a5-alignment/models/Llama-3.1-8B",
+  "data_dir": "/root/cs336-assignment5-alignment/data/mmlu",
+  "split": "test",
+  "num_examples": 10,
+  "correct": 5,
+  "accuracy": 50.0,
+  "failed_to_parse": 0,
+  "throughput_examples_per_second": 3.37058982171724,
+  "generation_time_seconds": 2.9668397903442383,
+  "subject_accuracies": {
+    "abstract_algebra": 50.0
+  }
+}

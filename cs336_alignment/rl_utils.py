@@ -39,17 +39,26 @@ def compute_group_normalized_rewards(
                 of rewards).
     """
     # TODO: Implement this function
-    rewards = torch.tensor([reward_fn(response, gt)["reward"] for response, gt in zip(rollout_responses, repeated_ground_truths)])
-    rewards = rearrange(rewards, "(n g) -> n g", g=group_size)
-    mean = torch.mean(rewards, dim=1, keepdim=True)
-    std = torch.std(rewards, dim=1, keepdim=True)
+    reward_infos = [reward_fn(response, gt) for response, gt in zip(rollout_responses, repeated_ground_truths)]
+    rewards = torch.tensor([info["reward"] for info in reward_infos])
+    format_rewards = torch.tensor([info.get("format_reward", 0.0) for info in reward_infos])
+    answer_rewards = torch.tensor([info.get("answer_reward", 0.0) for info in reward_infos])
+    
+    rewards_grouped = rearrange(rewards, "(n g) -> n g", g=group_size)
+    mean = torch.mean(rewards_grouped, dim=1, keepdim=True)
+    std = torch.std(rewards_grouped, dim=1, keepdim=True)
     if normalize_by_std:
-        advantages = (rewards - mean) / (std + advantage_eps)
+        advantages = (rewards_grouped - mean) / (std + advantage_eps)
     else:
-        advantages = rewards - mean
+        advantages = rewards_grouped - mean
+    
+    # Return order: (advantages/normalized_rewards, raw_rewards, metadata)
     return advantages.flatten(), rewards.flatten(), {
         "mean": mean,
         "std": std,
+        "reward_mean": rewards.mean().item(),
+        "format_reward_mean": format_rewards.mean().item(),
+        "answer_reward_mean": answer_rewards.mean().item(),
     }
 
 

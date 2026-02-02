@@ -94,10 +94,8 @@ def evaluate(llm, sampling_params, val_prompts: list[str], val_ground_truths: li
     correct = 0
     for output, ground_truth in zip(outputs, val_ground_truths):
         response = output.outputs[0].text
-        if not response.endswith("</answer>"):
-            response = response + "</answer>"
         reward_info = r1_zero_reward_fn(response, ground_truth)
-        if reward_info["answer_reward"] == 1.0:
+        if reward_info["reward"] == 1.0:
             correct += 1
     
     accuracy = correct / len(val_prompts) * 100
@@ -116,6 +114,7 @@ def train(
     vllm_gpu: int = 0,
     train_gpu: int = 1,
     vllm_gpu_memory_utilization: float = 0.5,
+    max_grad_norm: float = None,
     use_wandb: bool = True,
 ):
     """Run SFT training with vLLM for evaluation.
@@ -268,6 +267,9 @@ def train(
             
             # Optimizer step
             if (num_batches % gradient_accumulation_steps == 0) or (i + batch_size >= len(train_prompts)):
+                # Gradient clipping
+                if max_grad_norm is not None and max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -335,6 +337,8 @@ Device Configuration:
                         help="(Deprecated) Training now shares GPU with vLLM")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.5,
                         help="Fraction of GPU memory for vLLM KV cache (default: 0.5, balances inference speed and training memory)")
+    parser.add_argument("--max_grad_norm", type=float, default=None,
+                        help="Maximum gradient norm for clipping (default: None, no clipping)")
     parser.add_argument("--wandb_project", type=str, default="sft-math")
     parser.add_argument("--wandb_api_key", type=str, default=None,
                         help="Wandb API key (or set WANDB_API_KEY env var)")
@@ -367,6 +371,7 @@ Device Configuration:
         vllm_gpu=args.vllm_gpu,
         train_gpu=args.train_gpu,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        max_grad_norm=args.max_grad_norm,
         use_wandb=use_wandb,
     )
     

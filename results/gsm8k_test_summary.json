@@ -1,0 +1,11 @@
+{
+  "model_path": "/mnt/fsx/fsx-pred/prediction/tdvi/data/a5-alignment/models/Llama-3.1-8B",
+  "data_dir": "/root/cs336-assignment5-alignment/data/gsm8k",
+  "split": "test",
+  "num_examples": 10,
+  "correct": 2,
+  "accuracy": 20.0,
+  "failed_to_parse": 0,
+  "throughput_examples_per_second": 2.0930939095282066,
+  "generation_time_seconds": 4.777616500854492
+}

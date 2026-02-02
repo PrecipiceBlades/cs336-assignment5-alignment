@@ -7,6 +7,7 @@ from torch import Tensor
 from transformers import PreTrainedTokenizerBase, PreTrainedModel
 from unittest.mock import patch
 from vllm import LLM
+from typing import Any
 
 
 def vllm_set_random_seed(seed: int):
@@ -435,3 +436,60 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM) -> None:
         # Fallback for older vLLM versions (V0 engine)
         llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
         llm_model.load_weights(state_dict.items())
+
+def parse_mmlu_response(
+    mmlu_example: dict[str, Any],
+    model_output: str,
+) -> str | None:
+    """
+    Parse the model output into a predicted option letter (i.e., 'A', 'B', 'C', or 'D').
+    If the model output cannot be parsed into a prediction option letter, return None.
+    """
+    import re
+    
+    # Try to find answer patterns like "answer is A", "answer: B", "is C", etc.
+    # Look for a standalone letter A, B, C, or D that appears to be the answer
+    patterns = [
+        r'(?:answer|choice)\s*(?:is|:)\s*([A-D])\b',  # "answer is A", "choice: B"
+        r'\b([A-D])\s*(?:is\s+(?:the\s+)?(?:correct|right))',  # "A is correct", "B is the right"
+        r'^([A-D])[\.\s]',  # Starts with "A." or "A "
+        r'\b([A-D])\b',  # Any standalone letter A-D as fallback
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, model_output, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    
+    return None
+
+
+def parse_gsm8k_response(model_output: str) -> str | None:
+    """
+    Parse GSM8K model output into a predicted numeric answer by taking the last number
+    that occurs in the output.
+    
+    Args:
+        model_output: The model's output text
+        
+    Returns:
+        str with the predicted numeric answer, or None if no number found
+    """
+    import re
+    
+    # Find all numbers in the output (integers or decimals, possibly negative)
+    # Match patterns like: 72, 3.14, -5, 1,000 (with commas)
+    numbers = re.findall(r'-?[\d,]+\.?\d*', model_output)
+    
+    if not numbers:
+        return None
+    
+    # Take the last number and clean it up (remove commas)
+    last_number = numbers[-1].replace(',', '')
+    
+    # Validate it's actually a number
+    try:
+        float(last_number)
+        return last_number
+    except ValueError:
+        return None
