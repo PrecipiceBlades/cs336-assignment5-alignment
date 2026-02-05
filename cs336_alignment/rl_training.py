@@ -24,7 +24,9 @@ from .utils import (
 from .rl_utils import (
     grpo_microbatch_train_step,
     compute_group_normalized_rewards,
+    compute_policy_gradient_loss,
     masked_mean,
+    masked_normalize,
 )
 
 def print_flush(*args, **kwargs):
@@ -102,6 +104,7 @@ def train(
     cliprange: float = 0.2,  # For GRPO-Clip
     eval_interval: int = 10,  # Evaluate every N steps
     use_wandb: bool = True,
+    length_normalization: Literal["masked_mean", "masked_normalize"] = "masked_mean",
 ):
     """Run RL training with vLLM for evaluation.
     Device Strategy:
@@ -229,6 +232,7 @@ def train(
                 "max_grad_norm": max_grad_norm,
                 "cliprange": cliprange,
                 "is_off_policy": is_off_policy,
+                "length_normalization": length_normalization,
             }
         )
     
@@ -324,17 +328,28 @@ def train(
                 policy_log_probs = log_prob_result["log_probs"]
                 token_entropy = log_prob_result["token_entropy"]
                 
-                # Compute loss and backward
-                loss, loss_metadata = grpo_microbatch_train_step(
+                # Compute per-token loss
+                per_token_loss, loss_metadata = compute_policy_gradient_loss(
                     policy_log_probs, 
-                    mb_response_mask, 
-                    gradient_accumulation_steps, 
                     loss_type,
                     raw_rewards=mb_raw_rewards,
                     advantages=mb_advantages,
                     old_log_probs=mb_old_log_probs,
                     cliprange=cliprange,
                 )
+                
+                # Apply length normalization
+                if length_normalization == "masked_mean":
+                    loss = masked_mean(per_token_loss, mb_response_mask)
+                else:  # masked_normalize
+                    loss = masked_normalize(
+                        per_token_loss, mb_response_mask,
+                        dim=None, constant_normalizer=float(sampling_max_tokens)
+                    )
+                
+                # Scale for gradient accumulation and backward
+                loss = loss / gradient_accumulation_steps
+                loss.backward()
                 
                 # Accumulate for logging
                 epoch_losses.append(loss.item() * gradient_accumulation_steps)  # Undo the scaling
@@ -436,8 +451,11 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=128)
     parser.add_argument("--loss_type", type=str, default="reinforce_with_baseline",
                         choices=["no_baseline", "reinforce_with_baseline", "grpo_clip"])
-    parser.add_argument("--use_std_normalization", type=bool, default=True)
+    parser.add_argument("--no_std_normalization", action="store_true",
+                        help="Disable std normalization in advantage computation")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--length_normalization", type=str, default="masked_mean",
+                        choices=["masked_mean", "masked_normalize"])
     parser.add_argument("--cliprange", type=float, default=0.2)
     parser.add_argument("--eval_interval", type=int, default=10)
     parser.add_argument("--no_wandb", action="store_true")
@@ -461,11 +479,12 @@ def main():
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         loss_type=args.loss_type,
-        use_std_normalization=args.use_std_normalization,
+        use_std_normalization=not args.no_std_normalization,
         max_grad_norm=args.max_grad_norm,
         cliprange=args.cliprange,
         eval_interval=args.eval_interval,
         use_wandb=not args.no_wandb,
+        length_normalization=args.length_normalization,
     )
     print_flush(f"Final accuracy: {final_accuracy}")
 

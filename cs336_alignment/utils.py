@@ -493,3 +493,134 @@ def parse_gsm8k_response(model_output: str) -> str | None:
         return last_number
     except ValueError:
         return None
+
+
+# ============================================================================
+# PackedSFTDataset for instruction tuning
+# ============================================================================
+
+import os
+import json
+from pathlib import Path
+from torch.utils.data import Dataset
+
+
+class PackedSFTDataset(Dataset):
+    """A PyTorch Dataset for instruction tuning that packs multiple documents
+    into fixed-length sequences.
+    
+    This dataset:
+    1. Loads instruction tuning data from a JSONL file
+    2. Formats each example using an instruction prompt template
+    3. Tokenizes all documents and concatenates them with BOS/EOS tokens
+    4. Chunks the concatenated tokens into fixed-length sequences
+    
+    Each example contains:
+    - input_ids: tokens [0:seq_length]
+    - labels: tokens [1:seq_length+1] (shifted by 1 for next-token prediction)
+    """
+    
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        dataset_path: str | os.PathLike,
+        seq_length: int,
+        shuffle: bool,
+    ):
+        """Construct the dataset.
+        
+        Args:
+            tokenizer: A transformers tokenizer for tokenizing and encoding.
+            dataset_path: Path to instruction tuning data (JSONL format).
+            seq_length: Desired length of sequences to generate.
+            shuffle: Whether to shuffle documents before concatenation.
+        """
+        # Load the prompt template
+        PROMPT_TEMPLATE = (Path(__file__).parent / "prompts" / "alpaca_sft.prompt").read_text()
+        
+        # Load and format documents
+        documents = []
+        with open(dataset_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                data = json.loads(line)
+                prompt = data["prompt"]
+                response = data["response"]
+                document = PROMPT_TEMPLATE.format(instruction=prompt, response=response)
+                # Remove trailing newline to avoid tokenization issues
+                document = document.rstrip('\n')
+                documents.append(document)
+        
+        # Shuffle documents if requested
+        if shuffle:
+            random.shuffle(documents)
+        
+        # Tokenize all documents and concatenate with BOS/EOS tokens
+        all_tokens = []
+        bos_token_id = tokenizer.bos_token_id
+        eos_token_id = tokenizer.eos_token_id
+        
+        for doc in documents:
+            # Add BOS token before each document
+            all_tokens.append(bos_token_id)
+            # Tokenize document without special tokens
+            doc_tokens = tokenizer.encode(doc, add_special_tokens=False)
+            all_tokens.extend(doc_tokens)
+            # Add EOS token after each document
+            all_tokens.append(eos_token_id)
+        
+        # Chunk into sequences of seq_length
+        self.examples = []
+        num_sequences = (len(all_tokens) - 1) // seq_length
+        
+        for i in range(num_sequences):
+            start_idx = i * seq_length
+            input_ids = all_tokens[start_idx : start_idx + seq_length]
+            labels = all_tokens[start_idx + 1 : start_idx + seq_length + 1]
+            self.examples.append({
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "labels": torch.tensor(labels, dtype=torch.long),
+            })
+    
+    def __len__(self) -> int:
+        """Returns the number of sequences in this Dataset."""
+        return len(self.examples)
+    
+    def __getitem__(self, i: int) -> dict[str, Tensor]:
+        """Returns the ith element of the Dataset.
+        
+        Returns:
+            dict with keys:
+                - input_ids: tensor of shape (seq_length,)
+                - labels: tensor of shape (seq_length,)
+        """
+        return self.examples[i]
+
+
+def iterate_batches(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+):
+    """Create a DataLoader for the dataset.
+    
+    Args:
+        dataset: A Dataset returning dicts with 'input_ids' and 'labels' tensors.
+        batch_size: Batch size for the DataLoader.
+        shuffle: Whether to shuffle the data.
+        
+    Returns:
+        A DataLoader that yields batches of stacked input_ids and labels.
+    """
+    from torch.utils.data import DataLoader
+    
+    def collate_fn(batch):
+        input_ids = torch.stack([item["input_ids"] for item in batch])
+        labels = torch.stack([item["labels"] for item in batch])
+        return {"input_ids": input_ids, "labels": labels}
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+    )

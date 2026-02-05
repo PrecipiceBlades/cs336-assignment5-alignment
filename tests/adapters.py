@@ -317,7 +317,13 @@ def run_masked_normalize(
         torch.Tensor, the normalized sum, where masked elements
             (mask=0) don't contribute to the sum.
     """
-    raise NotImplementedError
+    from cs336_alignment.rl_utils import masked_normalize
+    return masked_normalize(
+        tensor=tensor,
+        mask=mask,
+        dim=dim,
+        constant_normalizer=normalize_constant,
+    )
 
 
 """
@@ -353,7 +359,13 @@ def get_packed_sft_dataset(
         "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
         the token IDs for the language modeling labels.
     """
-    raise NotImplementedError
+    from cs336_alignment.utils import PackedSFTDataset
+    return PackedSFTDataset(
+        tokenizer=tokenizer,
+        dataset_path=dataset_path,
+        seq_length=seq_length,
+        shuffle=shuffle,
+    )
 
 
 def run_iterate_batches(
@@ -376,7 +388,8 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+    from cs336_alignment.utils import iterate_batches
+    return iterate_batches(dataset, batch_size, shuffle)
 
 
 def run_parse_mmlu_response(
@@ -456,4 +469,5 @@ def run_compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+    from cs336_alignment.rl_utils import dpo_loss
+    return dpo_loss(lm, lm_ref, tokenizer, beta, prompt, response_chosen, response_rejected)

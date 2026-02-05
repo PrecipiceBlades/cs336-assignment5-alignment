@@ -197,6 +197,30 @@ def masked_mean(
     return torch.sum(tensor * mask, dim=dim) / torch.sum(mask, dim=dim)
 
 
+def masked_normalize(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+    constant_normalizer: float = 1.0,
+) -> torch.Tensor:
+    """Sum over a dimension and normalize by a constant, considering only masked elements.
+
+    Unlike masked_mean which divides by the actual count of masked elements,
+    this divides by a fixed constant (e.g., max sequence length).
+
+    Args:
+        tensor: The data to sum and normalize.
+        mask: Same shape as tensor; positions with 1 are included in the sum.
+        dim: Dimension over which to sum before normalization. If None, sum over
+            all dimensions.
+        constant_normalizer: The constant to divide by for normalization.
+
+    Returns:
+        torch.Tensor: The normalized sum, where masked elements (mask=0) don't contribute.
+    """
+    return torch.sum(tensor * mask, dim=dim) / constant_normalizer
+
+
 def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
@@ -240,3 +264,69 @@ def grpo_microbatch_train_step(
     loss = loss / gradient_accumulation_steps
     loss.backward()
     return loss, metadata
+
+def dpo_loss(
+    lm: torch.nn.Module,
+    lm_ref: torch.nn.Module,
+    tokenizer: "PreTrainedTokenizerBase",
+    beta: float,
+    prompt: str,
+    response_chosen: str,
+    response_rejected: str) -> torch.Tensor:
+    """Compute the DPO loss for a single example.
+
+    The DPO loss is:
+        -log(sigmoid(beta * (log_ratio_chosen - log_ratio_rejected)))
+    where log_ratio = log pi(y|x) - log pi_ref(y|x)
+
+    Args:
+        lm: The model to train.
+        lm_ref: The reference model.
+        tokenizer: The tokenizer to use.
+        beta: The DPO beta hyperparameter.
+        prompt: The prompt to generate responses for.
+        response_chosen: The chosen response.
+        response_rejected: The rejected response.
+    
+    Returns:
+        torch.Tensor: Scalar DPO loss for this example.
+    """
+    from cs336_alignment.utils import tokenize_prompt_and_output, get_response_log_probs
+    
+    device = next(lm.parameters()).device
+    
+    # Tokenize prompt + chosen response
+    chosen_batch = tokenize_prompt_and_output([prompt], [response_chosen], tokenizer)
+    chosen_input_ids = chosen_batch["input_ids"].to(device)
+    chosen_labels = chosen_batch["labels"].to(device)
+    chosen_mask = chosen_batch["response_mask"].to(device)
+    
+    # Tokenize prompt + rejected response
+    rejected_batch = tokenize_prompt_and_output([prompt], [response_rejected], tokenizer)
+    rejected_input_ids = rejected_batch["input_ids"].to(device)
+    rejected_labels = rejected_batch["labels"].to(device)
+    rejected_mask = rejected_batch["response_mask"].to(device)
+    
+    # Get log probs from policy model
+    policy_chosen_log_probs = get_response_log_probs(lm, chosen_input_ids, chosen_labels)["log_probs"]
+    policy_rejected_log_probs = get_response_log_probs(lm, rejected_input_ids, rejected_labels)["log_probs"]
+    
+    # Get log probs from reference model (no gradients needed)
+    with torch.no_grad():
+        ref_chosen_log_probs = get_response_log_probs(lm_ref, chosen_input_ids, chosen_labels)["log_probs"]
+        ref_rejected_log_probs = get_response_log_probs(lm_ref, rejected_input_ids, rejected_labels)["log_probs"]
+    
+    # Sum log probs over response tokens only (using mask)
+    policy_chosen_sum = (policy_chosen_log_probs * chosen_mask).sum()
+    policy_rejected_sum = (policy_rejected_log_probs * rejected_mask).sum()
+    ref_chosen_sum = (ref_chosen_log_probs * chosen_mask).sum()
+    ref_rejected_sum = (ref_rejected_log_probs * rejected_mask).sum()
+    
+    # Compute log ratios: log pi(y|x) - log pi_ref(y|x)
+    log_ratio_chosen = policy_chosen_sum - ref_chosen_sum
+    log_ratio_rejected = policy_rejected_sum - ref_rejected_sum
+    
+    # DPO loss: -log(sigmoid(beta * (log_ratio_chosen - log_ratio_rejected)))
+    loss = -torch.nn.functional.logsigmoid(beta * (log_ratio_chosen - log_ratio_rejected))
+    
+    return loss
